@@ -18,6 +18,8 @@ import { useHabitValueAtTarget } from '../hooks/useHabitValueAtTarget';
 import HabitValueCalculator from './HabitValueCalculator';
 import { formatSec } from '../utils/formatSec';
 
+const TODAY_COLOR = '#2196f3';
+const DONE_COLOR = '#4caf50';
 const QUICK_ADD_BASE_STYLE = {
   border: '1px solid #4caf50',
   borderRadius: '3px',
@@ -126,6 +128,8 @@ export default function HabitRow({
   level,
   mainLevelIndex,
   requiredTarget,
+  requiredTargetRaw, // ✅ 新增
+  currentValue,
   totalCount = 0,
   nextLevelTotal = 0,
 
@@ -151,26 +155,63 @@ export default function HabitRow({
 
   const habitValueAtTarget = useHabitValueAtTarget({ items, updateItem });
   const timer = useSyncedBoundHabitTimer({
-  enabled: isMinuteUnit,
-  userId,
-  countdownSeconds: 5,
-  getBindTarget: () => ({
-    itemId: item.id,
-    date: selectedDate,
-    isLevelHabit,
-    mainLevelIndex
-  }),
-  getCurrentValueAtTarget: habitValueAtTarget.getRawValueAtTarget,
-  commitValueAtTarget: habitValueAtTarget.setRawValueAtTarget
-});
+    enabled: isMinuteUnit,
+    userId,
+    countdownSeconds: 5,
+    getBindTarget: () => ({
+      itemId: item.id,
+      date: selectedDate,
+      isLevelHabit,
+      mainLevelIndex
+    }),
+    getCurrentValueAtTarget: habitValueAtTarget.getRawValueAtTarget,
+    commitValueAtTarget: habitValueAtTarget.setRawValueAtTarget
+  });
 
   const label = isLevelHabit ? item.mainLevels?.[mainLevelIndex] || item.name : item.name;
   const status = completed ? '✅' : '☑️';
 
-  const todayNum = Number(displayValue) || 0; // displayValue: minutes 已是 UI 單位
-  const targetNum = Number(requiredTarget) || 0;
+  // ✅ 日/週/月/年 的進度分子要用 evaluate 回傳的 currentValue（它已經依 frequency 做加總）
+  // ✅ 分母要用 requiredTargetRaw（minutes=seconds）才能跟 currentValue 對齊
+  const curRaw = Number(currentValue) || 0;
+  const targetRaw = Number(requiredTargetRaw) || 0;
+
   const dayProgressPercent =
-    targetNum > 0 ? Math.min(100, Math.floor((todayNum / targetNum) * 100)) : 0;
+    targetRaw > 0 ? Math.min(100, Math.floor((curRaw / targetRaw) * 100)) : 0;
+  const freq = String(item.frequency || 'daily').toLowerCase();
+
+  const perLabelMap = {
+    daily: 'daily',
+    weekly: 'per week',
+    monthly: 'per month',
+    yearly: 'per year'
+  };
+
+  const perLabel = perLabelMap[freq] || freq;
+
+  const fmtRaw = (n) => (isMinuteUnit ? formatSec(Number(n) || 0) : String(Number(n) || 0));
+
+  // today: 直接用 input 顯示值（已經是你 hook 處理過的 display）
+  const todayText = String(displayValue ?? '0');
+
+  // period: 用 evaluate 的 currentValue/requiredTargetRaw（raw → 依 unit format）
+  const periodCurText = fmtRaw(curRaw);
+  const periodTargetText = fmtRaw(targetRaw);
+
+  // 你要的 UI 文字：
+  // daily: 30 / 30 reps (daily)
+  // weekly/monthly/yearly: 30(today) 90/300 reps (per week)
+  const isDaily = freq === 'daily';
+
+  const todayNode = <span style={{ color: '#2196f3' }}>{todayText}(today)</span>;
+
+  const periodNode = (
+    <span>
+      {' '}
+      {periodCurText} / {periodTargetText} {item.unit || ''}{' '}
+      {!isDaily && <span style={{ color: '#999' }}>({perLabel})</span>}
+    </span>
+  );
 
   const progressPercent =
     nextLevelTotal > 0
@@ -254,10 +295,25 @@ export default function HabitRow({
             {label}
           </span>
 
-          <div style={{ display: 'inline-flex', alignItems: 'baseline' }}>
-            {renderHabitInput()}
-            <span style={{ fontSize: '13px', color: '#555' }}>
-              /{requiredTarget} {item.unit}
+          <div style={{ display: 'inline-flex', alignItems: 'baseline', gap: '6px' }}>
+            <span style={{ fontSize: '12px', color: '#666', whiteSpace: 'nowrap' }}>
+              {isDaily ? (
+                <>
+                  <span style={{ color: completed ? DONE_COLOR : TODAY_COLOR }}>
+                    {periodCurText}
+                  </span>
+                  {' / '}
+                  {periodTargetText} {item.unit || ''}
+                </>
+              ) : (
+                <>
+                  <span style={{ color: completed ? DONE_COLOR : TODAY_COLOR }}>
+                    {todayText}(today)
+                  </span>{' '}
+                  {periodCurText} / {periodTargetText} {item.unit || ''}{' '}
+                  <span style={{ color: '#999' }}>({perLabel})</span>
+                </>
+              )}
             </span>
           </div>
 
@@ -315,7 +371,7 @@ export default function HabitRow({
           marginTop: '4px'
         }}
       >
-        <QuickAddButtons values={[5, 10, 20]} unit={item.unit} onAdd={addDisplayValue} />
+        <QuickAddButtons values={[1, 2, 5, 10, 20]} unit={item.unit} onAdd={addDisplayValue} />
 
         {isMinuteUnit && (
           <button

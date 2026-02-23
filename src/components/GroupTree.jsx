@@ -52,6 +52,8 @@ function GroupTree({
     level,
     mainLevelIndex,
     requiredTarget,
+    requiredTargetRaw,
+    currentValue,
     count,
     totalCount = 0,
     totalChildren = 0,
@@ -86,25 +88,25 @@ function GroupTree({
       }}
     >
       {isGroup && (
-  <GroupRow
-    item={item}
-    completed={completed}
-    level={level}
-    count={count}
-    totalChildren={totalChildren}
-    totalCount={totalCount}
-    nextLevelTotal={nextLevelTotal}
-    isCollapsed={isCollapsed}
-    isLevelGroup={isLevelGroup}
-    onToggleCollapse={toggleCollapse}
-    openDropdownId={openDropdownId}
-    setOpenDropdownId={setOpenDropdownId}
-    onEdit={() => setEditItem(item)}
-    onDelete={() => {
-      if (confirm(`Delete "${item.name}"?`)) deleteItem(item.id);
-    }}
-  />
-)}
+        <GroupRow
+          item={item}
+          completed={completed}
+          level={level}
+          count={count}
+          totalChildren={totalChildren}
+          totalCount={totalCount}
+          nextLevelTotal={nextLevelTotal}
+          isCollapsed={isCollapsed}
+          isLevelGroup={isLevelGroup}
+          onToggleCollapse={toggleCollapse}
+          openDropdownId={openDropdownId}
+          setOpenDropdownId={setOpenDropdownId}
+          onEdit={() => setEditItem(item)}
+          onDelete={() => {
+            if (confirm(`Delete "${item.name}"?`)) deleteItem(item.id);
+          }}
+        />
+      )}
       {isHabit && (
         <HabitRow
           userId={userId}
@@ -119,7 +121,8 @@ function GroupTree({
           completed={completed}
           level={level}
           mainLevelIndex={mainLevelIndex}
-          requiredTarget={requiredTarget}
+          requiredTargetRaw={requiredTargetRaw}
+          currentValue={currentValue}
           totalCount={totalCount}
           nextLevelTotal={nextLevelTotal}
           makeProgressBg={makeProgressBg}

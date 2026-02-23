@@ -14,6 +14,85 @@ const toProgressUnit = (item, value) => {
   return isMinutesUnit(item) ? n * 60 : n;
 };
 
+// --- Frequency goal picker (UI units) ---
+const getGoalUIByFrequency = (item) => {
+  const freq = String(item?.frequency || 'daily').toLowerCase();
+  if (freq === 'weekly') return item?.weeklyGoal ?? 0;
+  if (freq === 'monthly') return item?.monthlyGoal ?? 0;
+  if (freq === 'yearly') return item?.yearlyGoal ?? 0;
+  if (freq === 'life') return item?.lifeGoal ?? 0;
+  if (freq === 'none') return 0;
+  return item?.dailyGoal ?? 0;
+};
+
+// --- Sum progress map by frequency (progress units) ---
+// progressMap keys: 'YYYY-MM-DD' -> number (minutes habit stores seconds)
+const sumProgressByFrequency = (progressMap, selectedDate, frequency) => {
+  if (!progressMap) return 0;
+
+  const freq = String(frequency || 'daily').toLowerCase();
+
+  // Daily: today only
+  if (freq === 'daily') return Number(progressMap?.[selectedDate] ?? 0) || 0;
+
+  // None: always 0
+  if (freq === 'none') return 0;
+
+  // Life: sum all
+  if (freq === 'life') {
+    return Object.values(progressMap).reduce((sum, v) => sum + (Number(v) || 0), 0);
+  }
+
+  // Parse YYYY-MM-DD safely (local date)
+  const toDate = (s) => {
+    const [y, m, d] = String(s).split('-').map(Number);
+    return new Date(y, (m || 1) - 1, d || 1);
+  };
+
+  const dt = toDate(selectedDate);
+  dt.setHours(0, 0, 0, 0);
+
+  // Monday-start week (Mon..Sun)
+  const startOfWeek = (date) => {
+    const d = new Date(date);
+    const day = d.getDay(); // 0 Sun ... 6 Sat
+    const diff = day === 0 ? -6 : 1 - day; // move to Monday
+    d.setDate(d.getDate() + diff);
+    d.setHours(0, 0, 0, 0);
+    return d;
+  };
+
+  let from, to;
+
+  if (freq === 'weekly') {
+    from = startOfWeek(dt);
+    to = new Date(from);
+    to.setDate(to.getDate() + 6);
+    to.setHours(23, 59, 59, 999);
+  } else if (freq === 'monthly') {
+    from = new Date(dt.getFullYear(), dt.getMonth(), 1);
+    from.setHours(0, 0, 0, 0);
+    to = new Date(dt.getFullYear(), dt.getMonth() + 1, 0);
+    to.setHours(23, 59, 59, 999);
+  } else if (freq === 'yearly') {
+    from = new Date(dt.getFullYear(), 0, 1);
+    from.setHours(0, 0, 0, 0);
+    to = new Date(dt.getFullYear(), 11, 31);
+    to.setHours(23, 59, 59, 999);
+  } else {
+    // fallback daily
+    return Number(progressMap?.[selectedDate] ?? 0) || 0;
+  }
+
+  let sum = 0;
+  for (const [dateStr, v] of Object.entries(progressMap)) {
+    const d2 = toDate(dateStr);
+    d2.setHours(0, 0, 0, 0);
+    if (d2 >= from && d2 <= to) sum += Number(v) || 0;
+  }
+  return sum;
+};
+
 export function evaluateCompletion(items, id, selectedDate, visited = new Set()) {
   const item = items[id];
   if (!item) return { completed: false, count: 0, totalCount: 0 };
@@ -25,7 +104,7 @@ export function evaluateCompletion(items, id, selectedDate, visited = new Set())
       completed: false,
       count: 0,
       totalCount: 0,
-      totalChildren: item.type === 'group' ? (item.children?.length || 0) : 0,
+      totalChildren: item.type === 'group' ? item.children?.length || 0 : 0,
       nextLevelTotal: 0,
       level: 0,
       requiredTarget: item.type === 'group' ? Number(item.targetCount ?? 0) : 0
@@ -35,9 +114,7 @@ export function evaluateCompletion(items, id, selectedDate, visited = new Set())
   const nextVisited = new Set(visited);
   nextVisited.add(id);
 
-
-
-// ------------------------------------------------------------
+  // ------------------------------------------------------------
   // GROUP LEVEL (NEW)
   // ------------------------------------------------------------
   if (item.type === 'group' && item.levelEnabled) {
@@ -45,7 +122,6 @@ export function evaluateCompletion(items, id, selectedDate, visited = new Set())
     const childStats = children
       .map((childId) => evaluateCompletion(items, childId, selectedDate, nextVisited))
       .filter(Boolean);
-
 
     // child 的「進度比值」：能算就用 totalCount/nextLevelTotal，不能算就用 completed 轉 0/1
     const ratios = childStats.map((s) => {
@@ -115,7 +191,6 @@ export function evaluateCompletion(items, id, selectedDate, visited = new Set())
     };
   }
 
-
   // LEVEL HABIT
   if (item.type === 'habit' && item.levelEnabled) {
     const mainLevelIndex = item.currentMainLevel ?? 0;
@@ -124,7 +199,8 @@ export function evaluateCompletion(items, id, selectedDate, visited = new Set())
     // progress values are:
     // - seconds if unit === minutes
     // - original unit otherwise
-    const currentValue = Number(progressMap[selectedDate] ?? 0);
+    const freq = item.frequency ?? 'daily';
+    const currentValue = sumProgressByFrequency(progressMap, selectedDate, freq);
     const totalCount = Object.values(progressMap).reduce((sum, v) => sum + (Number(v) || 0), 0);
 
     // thresholds are stored in UI units (minutes when unit === minutes)
@@ -143,47 +219,49 @@ export function evaluateCompletion(items, id, selectedDate, visited = new Set())
     }
 
     // dailyGoal is in UI units (minutes when unit === minutes)
-    const requiredTargetUI = item.dailyGoal || 0;
+    const requiredTargetUI = getGoalUIByFrequency(item);
     const requiredTarget = toProgressUnit(item, requiredTargetUI);
-
-    const completed = currentValue >= requiredTarget;
+    const completed = requiredTarget > 0 ? currentValue >= requiredTarget : false;
 
     return {
       completed,
       level,
       mainLevelIndex,
-      currentValue,              // in progress unit (sec if minutes)
+      currentValue, // in progress unit (sec if minutes)
       requiredTarget: requiredTargetUI, // keep UI unit for display (minutes)
+      requiredTargetRaw: requiredTarget,
       count: 0,
-      totalCount,                // in progress unit
+      totalCount, // in progress unit
       nextLevelTotal: totalRequired // in progress unit
     };
   }
 
   // SIMPLE HABIT
   if (item.type === 'habit') {
-    const currentValue = Number(item.progressByDate?.[selectedDate] ?? 0);
+    const freq = item.frequency ?? 'daily';
+    const currentValue = sumProgressByFrequency(item.progressByDate, selectedDate, freq);
 
-    const requiredTargetUI = item.dailyGoal || 0;
+    const requiredTargetUI = getGoalUIByFrequency(item);
     const requiredTarget = toProgressUnit(item, requiredTargetUI);
 
-    const completed = currentValue >= requiredTarget;
+    const completed = requiredTarget > 0 ? currentValue >= requiredTarget : false;
 
     return {
       completed,
-      currentValue,                 // in progress unit (sec if minutes)
-      requiredTarget: requiredTargetUI // UI unit for display (minutes)
+      currentValue, // in progress unit (sec if minutes)
+      requiredTarget: requiredTargetUI, // UI unit for display (minutes)
+      requiredTargetRaw: requiredTarget
     };
   }
 
   // GROUP
   if (item.type === 'group') {
     const results = (item.children || []).map((childId) =>
-    evaluateCompletion(items, childId, selectedDate, nextVisited)
-  );
-  const count = results.filter((r) => r.completed).length;
-  const totalChildren = results.length;
-  const completed = count >= (item.targetCount || 0);
+      evaluateCompletion(items, childId, selectedDate, nextVisited)
+    );
+    const count = results.filter((r) => r.completed).length;
+    const totalChildren = results.length;
+    const completed = count >= (item.targetCount || 0);
 
     return {
       completed,
