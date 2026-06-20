@@ -1,9 +1,8 @@
 // File: src/App.jsx
 // Author: Cheng
 // Description:
-//    Main App component handling routing, Firebase auth, real-time Firestore sync,
-//    habit CRUD logic, and rendering views (Main, Calendar, Settings).
-//    Firebase writes: habits 使用 debounce（約 900ms）減少寫入次數；新增/編輯表單用 immediate 立即寫入。
+//    Main App component handling routing, Firebase auth, habit CRUD logic,
+//    storage mode (firebase / local), and rendering views (Main, Calendar, Settings).
 
 import { useState, useEffect, useRef } from 'react';
 import { auth } from './firebase';
@@ -17,11 +16,15 @@ import CalendarView from './views/CalendarView';
 import SettingsView from './views/SettingsView';
 import BottomBar from './components/BottomBar';
 import AddItemForm from './components/AddItemForm';
-import { db } from './firebase';
-import { collection, setDoc, doc, onSnapshot } from 'firebase/firestore';
-import { deleteDoc } from 'firebase/firestore';
+import {
+  getStorageMode,
+  setStorageMode as persistStorageMode,
+  subscribeItems,
+  saveItem,
+  saveAllItems,
+  deleteItem as deleteStoredItem
+} from './services/habitStorage';
 
-// Debounce Firestore writes per document to reduce write count (e.g. rapid +10/+20 clicks)
 const HABIT_WRITE_DEBOUNCE_MS = 900;
 
 function App() {
@@ -29,17 +32,21 @@ function App() {
   const userId = user?.uid;
 
   const [view, setView] = useState('main');
-  const [showForm, setShowForm] = useState(false); // Show add list or not
+  const [showForm, setShowForm] = useState(false);
   const [editItem, setEditItem] = useState(null);
-  const [openDropdownId, setOpenDropdownId] = useState(null); // null = no dropdown open
+  const [openDropdownId, setOpenDropdownId] = useState(null);
   const [selectedDate, setSelectedDate] = useState(new Date().toISOString().split('T')[0]);
   const [items, setItems] = useState({});
+  const [storageMode, setStorageModeState] = useState(getStorageMode);
 
   const pendingWritesRef = useRef({});
   const writeTimersRef = useRef({});
+  const storageModeRef = useRef(storageMode);
 
-  // Sets up an authentication state listener on mount; updates the user state when
-  // the auth status changes. Cleans up the listener when the component unmounts.
+  useEffect(() => {
+    storageModeRef.current = storageMode;
+  }, [storageMode]);
+
   useEffect(() => {
     const unsubscribe = onAuthStateChanged(auth, setUser);
     return () => unsubscribe();
@@ -48,24 +55,18 @@ function App() {
   useEffect(() => {
     if (!userId) return;
 
-    const unsubscribe = onSnapshot(
-      collection(db, `users/${userId}/habits`),
-      (snapshot) => {
-        const data = {};
-        snapshot.forEach((d) => {
-          data[d.id] = { id: d.id, ...d.data() }; // ✅ 補 id
-        });
-        setItems(data);
-      },
+    const unsub = subscribeItems(
+      storageMode,
+      userId,
+      setItems,
       (err) => {
-        console.error('🔥 habits onSnapshot error:', err.code, err.message);
+        console.error('🔥 habits subscribe error:', err?.code, err?.message);
       }
     );
 
-    return () => unsubscribe();
-  }, [userId]);
+    return () => unsub?.();
+  }, [userId, storageMode]);
 
-  // Clear debounce timers on unmount (do not flush to avoid write after logout)
   useEffect(() => {
     return () => {
       Object.values(writeTimersRef.current).forEach(clearTimeout);
@@ -74,13 +75,7 @@ function App() {
     };
   }, []);
 
-  useEffect(() => {
-    localStorage.setItem('habit_items', JSON.stringify(items));
-  }, [items]);
-
   if (!user) return <Login onLogin={setUser} />;
-
-  const handleLogout = () => signOut(auth);
 
   const formatDate = (date) => date.toISOString().split('T')[0];
 
@@ -101,8 +96,9 @@ function App() {
     delete pendingWritesRef.current[id];
     delete writeTimersRef.current[id];
     if (!toWrite || !uid) return;
-    setDoc(doc(db, `users/${uid}/habits`, toWrite.id), toWrite, { merge: true }).catch((e) => {
-      console.error('🔥 setDoc failed:', e.code, e.message, toWrite);
+
+    saveItem(storageModeRef.current, uid, toWrite).catch((e) => {
+      console.error('🔥 saveItem failed:', e?.code, e?.message, toWrite);
     });
   };
 
@@ -120,14 +116,12 @@ function App() {
     const id = updated.id;
     const immediate = options.immediate === true;
 
-    // UI 先更新（即時反應）
     setItems((prev) => ({
       ...prev,
       [id]: updated
     }));
 
     if (immediate) {
-      // 新增/編輯表單儲存時立即寫入，不 debounce
       if (writeTimersRef.current[id]) {
         clearTimeout(writeTimersRef.current[id]);
         delete writeTimersRef.current[id];
@@ -137,30 +131,63 @@ function App() {
       return;
     }
 
-    // Debounce Firestore write: 同一 document 短時間內只寫入最後一次
     pendingWritesRef.current[id] = updated;
     if (writeTimersRef.current[id]) clearTimeout(writeTimersRef.current[id]);
     writeTimersRef.current[id] = setTimeout(() => {
       flushOne(id, userId);
     }, HABIT_WRITE_DEBOUNCE_MS);
   };
-  const deleteItem = async (idToDelete) => {
-    await deleteDoc(doc(db, `users/${userId}/habits`, idToDelete));
-    setItems((prev) => {
-      const updated = { ...prev };
-      delete updated[idToDelete];
-      for (const key in updated) {
-        const item = updated[key];
 
-        if (item.type === 'group' && item.children) {
-          updated[key] = {
-            ...item, // ← 建立新 object（重要）
-            children: item.children.filter((childId) => childId !== idToDelete)
-          };
+  const deleteItem = async (idToDelete) => {
+    if (!userId) return;
+
+    const nextItems = { ...items };
+    delete nextItems[idToDelete];
+
+    const groupsToUpdate = [];
+    for (const key in nextItems) {
+      const item = nextItems[key];
+      if (item.type === 'group' && item.children) {
+        const newChildren = item.children.filter((childId) => childId !== idToDelete);
+        if (newChildren.length !== item.children.length) {
+          nextItems[key] = { ...item, children: newChildren };
+          groupsToUpdate.push(nextItems[key]);
         }
       }
-      return updated;
-    });
+    }
+
+    setItems(nextItems);
+
+    const mode = storageModeRef.current;
+    try {
+      if (mode === 'local') {
+        await saveAllItems(mode, userId, nextItems);
+      } else {
+        await deleteStoredItem(mode, userId, idToDelete);
+        for (const group of groupsToUpdate) {
+          await saveItem(mode, userId, group);
+        }
+      }
+    } catch (e) {
+      console.error('🔥 deleteItem failed:', e?.code, e?.message);
+    }
+  };
+
+  const handleStorageModeChange = async (nextMode) => {
+    const normalized = nextMode === 'local' ? 'local' : 'firebase';
+    if (normalized === storageMode) return;
+
+    if (normalized === 'local') {
+      if (userId) {
+        await saveAllItems('local', userId, items);
+      }
+      persistStorageMode('local');
+      setStorageModeState('local');
+      return;
+    }
+
+    persistStorageMode('firebase');
+    setStorageModeState('firebase');
   };
 
   return (
@@ -175,6 +202,7 @@ function App() {
         {view === 'main' && (
           <MainView
             userId={userId}
+            storageMode={storageMode}
             items={items}
             selectedDate={selectedDate}
             setSelectedDate={setSelectedDate}
@@ -191,9 +219,13 @@ function App() {
 
         {view === 'settings' && (
           <SettingsView
+            userId={userId}
+            storageMode={storageMode}
+            onStorageModeChange={handleStorageModeChange}
             items={items}
             setItems={setItems}
             updateItem={updateItem}
+            saveAllItems={saveAllItems}
             onLogout={() => signOut(auth)}
           />
         )}

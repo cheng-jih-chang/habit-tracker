@@ -4,23 +4,15 @@
 //   Main daily view for habit tracking. Displays a list of top-level habit groups,
 //   each rendered via the GroupTree component. Users can navigate between days
 //   using date controls, view or manage habit items, and perform CRUD operations.
-//   Designed to be the default user interface for daily habit interaction.
-//
-// Optimization goals (2026-02-21):
-//   ✅ Persist ONLY filters to Firestore (users/{uid}/ui/mainView)
-//   ✅ Do NOT persist viewFilter (switching All / filter buttons won't write)
-//   ✅ Debounced + deduped writes (write only when filters truly changed)
-//   ✅ Stable keys for filter buttons (id = itemId) to prevent flicker
-//   ✅ Avoid invalid hook order / early-return issues
 
 import GroupTree from '../components/GroupTree';
 import AddFilterModal from '../components/AddFilterModal';
 import { useEffect, useMemo, useRef, useState } from 'react';
-import { db } from '../firebase';
-import { doc, onSnapshot, setDoc, serverTimestamp } from 'firebase/firestore';
+import { subscribeMainViewUi, saveMainViewUi } from '../services/habitStorage';
 
 export default function MainView({
   userId,
+  storageMode,
   items,
   selectedDate,
   setSelectedDate,
@@ -34,12 +26,11 @@ export default function MainView({
 }) {
   const [showFilterModal, setShowFilterModal] = useState(false);
   const [collapsedMap, setCollapsedMap] = useState({});
-  const [viewFilter, setViewFilter] = useState('all'); // local only (NOT persisted)
-  const [filters, setFilters] = useState([]); // [{ id: itemId, itemId }]
+  const [viewFilter, setViewFilter] = useState('all');
+  const [filters, setFilters] = useState([]);
   const uiHydratingRef = useRef(true);
 
-  // Persist only filters: debounce + dedupe
-  const lastFiltersRef = useRef(''); // JSON string of sorted itemIds
+  const lastFiltersRef = useRef('');
   const writeTimerRef = useRef(null);
 
   const topLevelItems = useMemo(() => {
@@ -49,59 +40,32 @@ export default function MainView({
     return Object.values(items).filter((item) => !allChildren.includes(item.id));
   }, [items]);
 
-  // 1) Read UI config (filters only) from Firestore
   useEffect(() => {
     if (!userId) return;
 
-    const ref = doc(db, `users/${userId}/ui`, 'mainView');
+    uiHydratingRef.current = true;
 
-    const unsub = onSnapshot(
-      ref,
-      async (snap) => {
-        if (!snap.exists()) {
-          // First login: set defaults locally, then create doc once
-          setFilters([]);
-          setViewFilter('all');
-
-          try {
-            await setDoc(ref, { filters: [], updatedAt: serverTimestamp() }, { merge: true });
-            lastFiltersRef.current = JSON.stringify([]); // keep dedupe in sync
-          } catch (e) {
-            console.error('🔥 init ui/mainView failed:', e.code, e.message);
-          } finally {
-            uiHydratingRef.current = false;
-          }
-          return;
-        }
-
-        const data = snap.data() || {};
-        const itemIds = Array.isArray(data.filters) ? data.filters : [];
-
-        // Stable keys: id = itemId
+    const unsub = subscribeMainViewUi(
+      storageMode,
+      userId,
+      (data) => {
+        const itemIds = Array.isArray(data?.filters) ? data.filters : [];
         setFilters(itemIds.map((itemId) => ({ id: itemId, itemId })));
-
-        // viewFilter is local only; reset to All on login/device switch
         setViewFilter('all');
 
-        // keep dedupe ref aligned to avoid immediate re-write
         const sorted = Array.from(new Set(itemIds)).sort();
         lastFiltersRef.current = JSON.stringify(sorted);
-
         uiHydratingRef.current = false;
       },
       (err) => {
-        console.error('🔥 ui/mainView onSnapshot error:', err.code, err.message);
+        console.error('🔥 ui/mainView subscribe error:', err?.code, err?.message);
         uiHydratingRef.current = false;
       }
     );
 
-    return () => unsub();
-  }, [userId]);
+    return () => unsub?.();
+  }, [userId, storageMode]);
 
-  // 2) Clean up filters when items/topLevelItems change (after hydration)
-  //    - Remove filters that no longer exist as top-level items
-  //    - Ensure viewFilter points to existing item, else fallback to 'all'
-  //    - Do NOT set lastFiltersRef here: let effect #3 persist cleaned list (one write)
   useEffect(() => {
     if (uiHydratingRef.current) return;
     if (!items || Object.keys(items).length === 0) return;
@@ -119,7 +83,6 @@ export default function MainView({
     });
   }, [topLevelItems, items]);
 
-  // 3) Write ONLY filters back to Firestore (debounced + deduped)
   useEffect(() => {
     if (!userId) return;
     if (uiHydratingRef.current) return;
@@ -132,21 +95,19 @@ export default function MainView({
     if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
 
     writeTimerRef.current = setTimeout(() => {
-      const ref = doc(db, `users/${userId}/ui`, 'mainView');
-
-      setDoc(ref, { filters: itemIds, updatedAt: serverTimestamp() }, { merge: true })
+      saveMainViewUi(storageMode, userId, { filters: itemIds })
         .then(() => {
           lastFiltersRef.current = payloadStr;
         })
         .catch((e) => {
-          console.error('🔥 write filters failed:', e.code, e.message);
+          console.error('🔥 write filters failed:', e?.code, e?.message);
         });
     }, 600);
 
     return () => {
       if (writeTimerRef.current) clearTimeout(writeTimerRef.current);
     };
-  }, [userId, filters]);
+  }, [userId, storageMode, filters]);
 
   const visibleItems = useMemo(() => {
     if (viewFilter === 'all') return topLevelItems;
@@ -156,7 +117,6 @@ export default function MainView({
 
   return (
     <>
-      {/* Date navigation header */}
       <div
         style={{
           position: 'sticky',
@@ -184,7 +144,6 @@ export default function MainView({
         </button>
       </div>
 
-      {/* Filter bar */}
       <div
         style={{
           display: 'flex',
@@ -219,12 +178,11 @@ export default function MainView({
 
           return (
             <button
-              key={f.id} // ✅ stable (id=itemId)
+              key={f.id}
               onClick={() => {
                 const target = items[f.itemId];
                 if (!target) return;
 
-                // group: show the group itself (and auto-expand it)
                 if (target.type === 'group') {
                   setViewFilter(target.id);
                   setCollapsedMap((prev) => ({ ...prev, [target.id]: false }));
@@ -264,12 +222,12 @@ export default function MainView({
         </button>
       </div>
 
-      {/* Main content */}
       <div style={{ maxWidth: '500px', margin: '0 auto' }}>
         {visibleItems.map((item) => (
           <GroupTree
             key={item.id}
             userId={userId}
+            storageMode={storageMode}
             items={items}
             itemId={item.id}
             selectedDate={selectedDate}
@@ -284,7 +242,6 @@ export default function MainView({
         ))}
       </div>
 
-      {/* Add / Remove filters modal */}
       <AddFilterModal
         open={showFilterModal}
         topLevelItems={topLevelItems}
@@ -294,16 +251,10 @@ export default function MainView({
           setFilters((prev) => {
             const exists = prev.some((f) => f.itemId === id);
             if (exists) {
-              // remove
               return prev.filter((f) => f.itemId !== id);
             }
-            // add (stable id)
             return [...prev, { id, itemId: id }];
           });
-
-          // ✅ We DO NOT persist viewFilter; also avoid auto-switching views here.
-          // If you want to auto-switch to the newly added filter, uncomment below:
-          // setViewFilter(id);
 
           const it = items[id];
           if (it?.type === 'group') {

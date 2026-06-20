@@ -10,9 +10,10 @@
 // Notes:
 //   - Minutes unit stored as seconds (handled by your hooks: useHabitValue/useHabitValueAtTarget)
 
-import { useRef, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { useClickOutside } from '../hooks/useClickOutside';
 import { useSyncedBoundHabitTimer } from '../hooks/useSyncedBoundHabitTimer';
+import { useBoundHabitTimer } from '../hooks/useBoundHabitTimer';
 import { useHabitValue } from '../hooks/useHabitValue';
 import { useHabitValueAtTarget } from '../hooks/useHabitValueAtTarget';
 import HabitValueCalculator from './HabitValueCalculator';
@@ -114,6 +115,7 @@ function DropdownMenu({
 
 export default function HabitRow({
   userId,
+  storageMode,
   item,
   items,
   selectedDate,
@@ -154,19 +156,37 @@ export default function HabitRow({
   useClickOutside(dropdownRef, () => setOpenDropdownId(null), showDropdown);
 
   const habitValueAtTarget = useHabitValueAtTarget({ items, updateItem });
-  const timer = useSyncedBoundHabitTimer({
-    enabled: isMinuteUnit,
-    userId,
-    countdownSeconds: 5,
-    getBindTarget: () => ({
+
+  const timerBindTarget = useMemo(
+    () => ({
       itemId: item.id,
       date: selectedDate,
       isLevelHabit,
       mainLevelIndex
     }),
+    [item.id, selectedDate, isLevelHabit, mainLevelIndex]
+  );
+
+  const getTimerBindTarget = useCallback(() => timerBindTarget, [timerBindTarget]);
+
+  const syncedTimer = useSyncedBoundHabitTimer({
+    enabled: isMinuteUnit && storageMode === 'firebase',
+    userId,
+    countdownSeconds: 5,
+    getBindTarget: getTimerBindTarget,
     getCurrentValueAtTarget: habitValueAtTarget.getRawValueAtTarget,
     commitValueAtTarget: habitValueAtTarget.setRawValueAtTarget
   });
+
+  const localTimer = useBoundHabitTimer({
+    enabled: isMinuteUnit && storageMode === 'local',
+    countdownSeconds: 5,
+    getBindTarget: getTimerBindTarget,
+    getCurrentValueAtTarget: habitValueAtTarget.getRawValueAtTarget,
+    commitValueAtTarget: habitValueAtTarget.setRawValueAtTarget
+  });
+
+  const timer = storageMode === 'local' ? localTimer : syncedTimer;
 
   const label = isLevelHabit ? item.mainLevels?.[mainLevelIndex] || item.name : item.name;
   const status = completed ? '✅' : '☑️';

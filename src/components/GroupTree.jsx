@@ -33,6 +33,7 @@ function makeProgressBg({ percent, completed }) {
 
 function GroupTree({
   userId,
+  storageMode,
   items,
   itemId,
   selectedDate,
@@ -110,6 +111,7 @@ function GroupTree({
       {isHabit && (
         <HabitRow
           userId={userId}
+          storageMode={storageMode}
           item={item}
           items={items}
           selectedDate={selectedDate}
@@ -135,6 +137,7 @@ function GroupTree({
           <GroupTree
             key={childId}
             userId={userId}
+            storageMode={storageMode}
             items={items}
             itemId={childId}
             selectedDate={selectedDate}
