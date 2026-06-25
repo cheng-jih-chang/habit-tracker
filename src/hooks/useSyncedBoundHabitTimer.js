@@ -100,22 +100,6 @@ export function useSyncedBoundHabitTimer({
     return `${mm}:${ss}`;
   }, []);
 
-  const ensureDocExists = useCallback(async (docRef) => {
-    await runTransaction(db, async (tx) => {
-      const snap = await tx.get(docRef);
-      if (!snap.exists()) {
-        tx.set(docRef, {
-          state: 'idle',
-          accumulatedSec: 0,
-          startedAt: null,
-          updatedAt: serverTimestamp(),
-          version: 0
-        });
-        recordStorageAccess('firebase', 'write', 1, 'timer.ensureDocExists.create');
-      }
-    });
-  }, []);
-
   const start = useCallback(async () => {
     if (!enabled) return;
     if (!userId) return;
@@ -129,32 +113,33 @@ export function useSyncedBoundHabitTimer({
 
     const localDocRef = buildDocRefFromTarget(resolvedTarget);
 
-    await ensureDocExists(localDocRef);
-
-    const skipBecauseAlreadyRunning = await runTransaction(db, async (tx) => {
-      const snap = await tx.get(localDocRef);
-      const d = snap.exists() ? snap.data() : {};
-      return d?.state === 'running';
-    });
-    if (skipBecauseAlreadyRunning) return;
-
-    countdownAbortRef.current = { aborted: false };
+    const token = { aborted: false };
+    countdownAbortRef.current = token;
     countdownRunningRef.current = true;
 
-    try {
-      setCountdown(countdownSeconds);
-      const token = countdownAbortRef.current;
+    setCountdown(countdownSeconds);
 
+    try {
       for (let t = countdownSeconds; t > 0; t--) {
         await new Promise((r) => setTimeout(r, 1000));
-        if (token.aborted) return;
+        if (token.aborted) {
+          setCountdown(0);
+          return;
+        }
         setCountdown((prev) => Math.max(0, prev - 1));
       }
 
+      if (token.aborted) {
+        setCountdown(0);
+        return;
+      }
+
       let didWrite = false;
+
       await runTransaction(db, async (tx) => {
         const snap = await tx.get(localDocRef);
         const d = snap.exists() ? snap.data() : {};
+
         if (d?.state === 'running') return;
 
         const nextVersion = (Number(d?.version) || 0) + 1;
@@ -163,19 +148,29 @@ export function useSyncedBoundHabitTimer({
           localDocRef,
           {
             state: 'running',
+            accumulatedSec: Number(d?.accumulatedSec) || 0,
             startedAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
             version: nextVersion
           },
           { merge: true }
         );
+
         didWrite = true;
       });
+
       if (didWrite) {
         recordStorageAccess('firebase', 'write', 1, 'timer.start.running');
       }
+    } catch (err) {
+      console.error('[TIMER] start error', err);
+      if (!token.aborted) {
+        setCountdown(0);
+      }
     } finally {
-      countdownRunningRef.current = false;
+      if (countdownAbortRef.current === token) {
+        countdownRunningRef.current = false;
+      }
     }
   }, [
     enabled,
@@ -183,8 +178,7 @@ export function useSyncedBoundHabitTimer({
     state,
     getBindTarget,
     countdownSeconds,
-    buildDocRefFromTarget,
-    ensureDocExists
+    buildDocRefFromTarget
   ]);
 
   const cancel = useCallback(() => {
@@ -206,38 +200,74 @@ export function useSyncedBoundHabitTimer({
 
     const localDocRef = buildDocRefFromTarget(resolvedTarget);
 
-    let didWrite = false;
-    await runTransaction(db, async (tx) => {
-      const snap = await tx.get(localDocRef);
-      if (!snap.exists()) return;
-
-      const d = snap.data() || {};
-      if (d.state !== 'running' || !d.startedAt?.toMillis) return;
-
-      const acc = Number(d.accumulatedSec) || 0;
-      const started = d.startedAt.toMillis();
-      const delta = Math.floor((Date.now() - started) / 1000);
-      const add = Math.max(0, delta);
-
-      const nextVersion = (Number(d.version) || 0) + 1;
-
-      tx.set(
-        localDocRef,
-        {
-          state: 'paused',
-          accumulatedSec: acc + add,
-          startedAt: null,
-          updatedAt: serverTimestamp(),
-          version: nextVersion
-        },
-        { merge: true }
-      );
-      didWrite = true;
-    });
-    if (didWrite) {
-      recordStorageAccess('firebase', 'write', 1, 'timer.pause.paused');
+    let optimisticAccumulatedSec;
+    if (state === 'running' && startedAtMs) {
+      optimisticAccumulatedSec =
+        accumulatedSec + Math.max(0, Math.floor((Date.now() - startedAtMs) / 1000));
+    } else {
+      optimisticAccumulatedSec = displaySec || accumulatedSec;
     }
-  }, [enabled, userId, getBindTarget, buildDocRefFromTarget]);
+
+    const previousState = state;
+    const previousAccumulatedSec = accumulatedSec;
+    const previousStartedAtMs = startedAtMs;
+    const previousDisplaySec = displaySec;
+
+    setState('paused');
+    setAccumulatedSec(optimisticAccumulatedSec);
+    setStartedAtMs(null);
+    setDisplaySec(optimisticAccumulatedSec);
+    setCountdown(0);
+
+    try {
+      let didWrite = false;
+      await runTransaction(db, async (tx) => {
+        const snap = await tx.get(localDocRef);
+        if (!snap.exists()) return;
+
+        const d = snap.data() || {};
+        if (d.state !== 'running' || !d.startedAt?.toMillis) return;
+
+        const acc = Number(d.accumulatedSec) || 0;
+        const started = d.startedAt.toMillis();
+        const delta = Math.floor((Date.now() - started) / 1000);
+        const add = Math.max(0, delta);
+
+        const nextVersion = (Number(d.version) || 0) + 1;
+
+        tx.set(
+          localDocRef,
+          {
+            state: 'paused',
+            accumulatedSec: acc + add,
+            startedAt: null,
+            updatedAt: serverTimestamp(),
+            version: nextVersion
+          },
+          { merge: true }
+        );
+        didWrite = true;
+      });
+      if (didWrite) {
+        recordStorageAccess('firebase', 'write', 1, 'timer.pause.paused');
+      }
+    } catch (err) {
+      console.error('[TIMER] pause error', err);
+      setState(previousState);
+      setAccumulatedSec(previousAccumulatedSec);
+      setStartedAtMs(previousStartedAtMs);
+      setDisplaySec(previousDisplaySec);
+    }
+  }, [
+    enabled,
+    userId,
+    getBindTarget,
+    buildDocRefFromTarget,
+    state,
+    accumulatedSec,
+    startedAtMs,
+    displaySec
+  ]);
 
   const stopAndCommit = useCallback(async () => {
     if (!enabled) return;
@@ -249,59 +279,78 @@ export function useSyncedBoundHabitTimer({
 
     const localDocRef = buildDocRefFromTarget(resolvedTarget);
 
-    let didWrite = false;
-    const secondsToCommit = await runTransaction(db, async (tx) => {
-      const snap = await tx.get(localDocRef);
-      if (!snap.exists()) return 0;
+    const previousState = state;
+    const previousAccumulatedSec = accumulatedSec;
+    const previousStartedAtMs = startedAtMs;
+    const previousDisplaySec = displaySec;
 
-      const d = snap.data() || {};
-      const acc = Number(d.accumulatedSec) || 0;
-
-      let add = 0;
-      if (d.state === 'running' && d.startedAt?.toMillis) {
-        const started = d.startedAt.toMillis();
-        const delta = Math.floor((Date.now() - started) / 1000);
-        add = Math.max(0, delta);
-      }
-
-      const total = acc + add;
-      const nextVersion = (Number(d.version) || 0) + 1;
-
-      tx.set(
-        localDocRef,
-        {
-          state: 'idle',
-          accumulatedSec: 0,
-          startedAt: null,
-          updatedAt: serverTimestamp(),
-          version: nextVersion
-        },
-        { merge: true }
-      );
-      didWrite = true;
-
-      return total;
-    });
-
-    if (didWrite) {
-      recordStorageAccess('firebase', 'write', 1, 'timer.stop.idle');
-    }
-
-    if (secondsToCommit > 0) {
-      const current = Number(getCurrentValueAtTarget?.(resolvedTarget)) || 0;
-      commitValueAtTarget?.(resolvedTarget, current + secondsToCommit);
-    }
-
-    setCountdown(0);
+    setState('idle');
+    setAccumulatedSec(0);
     setStartedAtMs(null);
     setDisplaySec(0);
+    setCountdown(0);
+
+    try {
+      let didWrite = false;
+      const secondsToCommit = await runTransaction(db, async (tx) => {
+        const snap = await tx.get(localDocRef);
+        if (!snap.exists()) return 0;
+
+        const d = snap.data() || {};
+        const acc = Number(d.accumulatedSec) || 0;
+
+        let add = 0;
+        if (d.state === 'running' && d.startedAt?.toMillis) {
+          const started = d.startedAt.toMillis();
+          const delta = Math.floor((Date.now() - started) / 1000);
+          add = Math.max(0, delta);
+        }
+
+        const total = acc + add;
+        const nextVersion = (Number(d.version) || 0) + 1;
+
+        tx.set(
+          localDocRef,
+          {
+            state: 'idle',
+            accumulatedSec: 0,
+            startedAt: null,
+            updatedAt: serverTimestamp(),
+            version: nextVersion
+          },
+          { merge: true }
+        );
+        didWrite = true;
+
+        return total;
+      });
+
+      if (didWrite) {
+        recordStorageAccess('firebase', 'write', 1, 'timer.stop.idle');
+      }
+
+      if (secondsToCommit > 0) {
+        const current = Number(getCurrentValueAtTarget?.(resolvedTarget)) || 0;
+        commitValueAtTarget?.(resolvedTarget, current + secondsToCommit);
+      }
+    } catch (err) {
+      console.error('[TIMER] stopAndCommit error', err);
+      setState(previousState);
+      setAccumulatedSec(previousAccumulatedSec);
+      setStartedAtMs(previousStartedAtMs);
+      setDisplaySec(previousDisplaySec);
+    }
   }, [
     enabled,
     userId,
     getBindTarget,
     buildDocRefFromTarget,
     getCurrentValueAtTarget,
-    commitValueAtTarget
+    commitValueAtTarget,
+    state,
+    accumulatedSec,
+    startedAtMs,
+    displaySec
   ]);
 
   const toggleBound = useCallback(() => {
